@@ -3169,6 +3169,10 @@ window.__ModuleLoader__.load({
       // and the before/after side only flips past the middle threshold.
       const dragPointRef = useRef(null);
       const sessionDropRef = useRef(null);
+      // One commit per drag gesture: the section and the sidebar fallback both
+      // accept a workspace drop, so the flag keeps the release from being
+      // applied twice.
+      const workspaceDropRef = useRef(false);
       const [editingGroup, setEditingGroup] = useState(null);
       const [editingName, setEditingName] = useState('');
       const [editingWorkspaceId, setEditingWorkspaceId] = useState(null);
@@ -3724,13 +3728,50 @@ window.__ModuleLoader__.load({
           && target.closest('button, input, textarea, select, a, [role="menuitem"]'));
       };
 
+      // FLIP runs the move as a transition, so the inline translateY only exists
+      // for a single frame; for the whole 180ms the computed matrix carries the
+      // current offset. Subtracting that offset recovers the layout top — without
+      // it the hit test compares the pointer against the animation. The row path
+      // measures offsetTop / offsetHeight for the same reason.
+      const translateYOf = (element) => {
+        const view = (typeof window !== 'undefined' && window && typeof window.getComputedStyle === 'function')
+          ? window.getComputedStyle(element)
+          : null;
+        const transform = view && view.transform ? view.transform : '';
+        if (!transform || transform === 'none') return 0;
+        const matrix = /^matrix\(([^)]+)\)$/u.exec(transform);
+        if (matrix) {
+          const shift = Number(matrix[1].split(',')[5]);
+          return Number.isFinite(shift) ? shift : 0;
+        }
+        const matrix3d = /^matrix3d\(([^)]+)\)$/u.exec(transform);
+        if (matrix3d) {
+          const shift = Number(matrix3d[1].split(',')[13]);
+          return Number.isFinite(shift) ? shift : 0;
+        }
+        const translate = /translateY\(\s*(-?[\d.]+)px\s*\)/u.exec(transform);
+        if (translate) {
+          const shift = Number(translate[1]);
+          return Number.isFinite(shift) ? shift : 0;
+        }
+        return 0;
+      };
+
+      const layoutRectOf = (element) => {
+        const rect = element.getBoundingClientRect();
+        if (!rect) return rect;
+        const shift = translateYOf(element);
+        if (shift === 0) return rect;
+        return { top: rect.top - shift, height: rect.height };
+      };
+
       // Half of the target used by the insert line: pointer above the middle
       // means "before", below means "after" (the Host's native workspace drag
       // uses the same rule).
       const halfOf = (event) => {
         const node = event && event.currentTarget;
         if (!node || typeof node.getBoundingClientRect !== 'function') return 'before';
-        const rect = node.getBoundingClientRect();
+        const rect = layoutRectOf(node);
         if (!rect || rect.height <= 0) return 'before';
         return event.clientY - rect.top < rect.height / 2 ? 'before' : 'after';
       };
@@ -3819,10 +3860,16 @@ window.__ModuleLoader__.load({
       };
 
       const beginDrag = (kind, event, info) => {
+        // A gesture that never got its dragend (the dragged node was removed,
+        // for instance) leaves a preview behind, and the next drag would take
+        // that stale order as its base. clearPreview() is a no-op when the
+        // preview is already null.
+        clearPreview();
         setDrag(Object.assign({ kind }, info));
         setDropHint(null);
         dragPointRef.current = null;
         sessionDropRef.current = null;
+        workspaceDropRef.current = false;
         try {
           event.dataTransfer.setData('text/plain', String(info.id));
           event.dataTransfer.effectAllowed = 'move';
@@ -3838,6 +3885,7 @@ window.__ModuleLoader__.load({
         setDropHint(null);
         dragPointRef.current = null;
         sessionDropRef.current = null;
+        workspaceDropRef.current = false;
       };
 
       // Header drag handles. Kept as plain calls (no inline block) so the header
@@ -3896,6 +3944,35 @@ window.__ModuleLoader__.load({
           ids: insertNear(ids, drag.id, targetId, pos),
         });
         setDropHint(null);
+      };
+
+      // A workspace drop commits the previewed order. Both the section and the
+      // sidebar fallback route here, and one gesture commits at most once.
+      const commitWorkspaceDrop = () => {
+        const active = drag;
+        if (!active || active.kind !== 'workspace') return false;
+        if (workspaceDropRef.current) return false;
+        const current = previewRef.current;
+        if (!current || current.kind !== 'workspace') return false;
+        const base = items.map((item) => String(item.workspaceId));
+        const order = current.order;
+        const index = order.indexOf(active.id);
+        if (index < 0 || order.join('|') === base.join('|') || typeof moveWorkspaceBefore !== 'function') return false;
+        // Set only once a commit is certain, right before the write: the flag
+        // means "already committed", not "a drop was seen".
+        workspaceDropRef.current = true;
+        const anchor = index + 1 < order.length ? order[index + 1] : undefined;
+        const pending = moveWorkspaceBefore(active.id, anchor);
+        if (pending && typeof pending.catch === 'function') {
+          // The Controller already rolls the list back when the Host refuses
+          // the write; leave a trace instead of swallowing the rejection.
+          pending.catch((error) => {
+            if (typeof console !== 'undefined' && console && typeof console.warn === 'function') {
+              console.warn('workspace reorder rejected:', error);
+            }
+          });
+        }
+        return true;
       };
 
       // A Session drop commits the previewed list; ownership (assignments vs the
@@ -4028,10 +4105,16 @@ window.__ModuleLoader__.load({
           // The whole workspace block is the reorder target: pointer above its
           // middle inserts before it, below inserts after it. The list reorders
           // live, so the target itself moves under the pointer.
+          // That live preview is also why every workspace dragover must cancel
+          // the event — including the one that lands on the dragged block
+          // itself. A dragover without preventDefault invalidates the current
+          // drop target, so the release fires dragend instead of drop and the
+          // preview would be rolled back.
           onDragOver: (event) => {
-            if (!drag || drag.kind !== 'workspace' || drag.id === wsKey) return;
+            if (!drag || drag.kind !== 'workspace') return;
             event.preventDefault();
             event.stopPropagation();
+            if (drag.id === wsKey) return;
             cancelLeave();
             previewWorkspaceAt(wsKey, halfOf(event));
           },
@@ -4039,17 +4122,7 @@ window.__ModuleLoader__.load({
             if (!drag || drag.kind !== 'workspace') return;
             event.preventDefault();
             event.stopPropagation();
-            const current = previewRef.current;
-            const base = items.map((item) => String(item.workspaceId));
-            if (current && current.kind === 'workspace') {
-              const order = current.order;
-              const index = order.indexOf(drag.id);
-              if (index >= 0 && order.join('|') !== base.join('|') && typeof moveWorkspaceBefore === 'function') {
-                const anchor = index + 1 < order.length ? order[index + 1] : undefined;
-                const pending = moveWorkspaceBefore(drag.id, anchor);
-                if (pending && typeof pending.catch === 'function') pending.catch(() => {});
-              }
-            }
+            commitWorkspaceDrop();
             endDrag();
           },
         },
@@ -4192,9 +4265,13 @@ window.__ModuleLoader__.load({
                 onDragOver: (event) => {
                   if (!drag) return;
                   if (drag.kind === 'group') {
-                    if (drag.id === group.key || drag.workspaceId !== wsKey) return;
+                    if (drag.workspaceId !== wsKey) return;
+                    // The group preview moves the dragged header under the
+                    // pointer too, so the self hit still has to keep the drop
+                    // target valid, exactly like the workspace block.
                     event.preventDefault();
                     event.stopPropagation();
+                    if (drag.id === group.key) return;
                     cancelLeave();
                     const sectionIds = (sectionsState.byWorkspace[wsKey] || EMPTY_BUCKET).sections.map((section) => section.id);
                     previewGroupAt(wsKey, sectionIds, group.key, halfOf(event));
@@ -4512,7 +4589,26 @@ window.__ModuleLoader__.load({
         : toastNode;
 
       return h(React.Fragment, null,
-        h('div', { className: 'dssx-browser' },
+        h('div', {
+          className: 'dssx-browser',
+          // The whole browser area is a workspace drop fallback: the toolbar
+          // above and the footer below belong to the sidebar too, and a release
+          // there used to leave no drop target at all. Sections stop the event
+          // on their own, so this fallback never commits twice. Other drag kinds
+          // keep bubbling to their own targets untouched.
+          onDragOver: (event) => {
+            if (!drag || drag.kind !== 'workspace') return;
+            event.preventDefault();
+            event.stopPropagation();
+          },
+          onDrop: (event) => {
+            if (!drag || drag.kind !== 'workspace') return;
+            event.preventDefault();
+            event.stopPropagation();
+            commitWorkspaceDrop();
+            endDrag();
+          },
+        },
           tools,
           h('div', { className: 'dssx-browser-scroll', ref: scrollRef }, body),
           h('div', { className: 'dssx-browser-foot' },
