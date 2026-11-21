@@ -12,8 +12,14 @@
  * Group data is plugin-owned and lives in this browser's localStorage,
  * keyed by Workspace id. It never touches the Session log.
  */
+// The loader keys registrations by package name: since DSH 0.2.2-rc.5 a
+// resource whose id is not the package `name` looks unregistered, and the
+// single-resource retry then replays this bundle into a "duplicate factory
+// registration" error, so `apply` never runs. Keep all three uses on PKG.
+const PKG = 'dsh-workspace-frontend';
+
 window.__ModuleLoader__.load({
-  id: '@local/dsh-workspace-frontend',
+  id: PKG,
   factory(require) {
     const React = require('react');
     const h = React.createElement;
@@ -35,7 +41,7 @@ window.__ModuleLoader__.load({
 
     const NS = 'sessionGroups';
     const STORAGE_KEY = 'dsh.session-groups.v1';
-    const CSS_ID = '@local/dsh-workspace-frontend/panel.css';
+    const CSS_ID = PKG + '/panel.css';
 
     const PALETTE = [
       '#D97757', '#6A9B7E', '#5B8DB8', '#B08BBB',
@@ -3682,7 +3688,7 @@ window.__ModuleLoader__.load({
         return null;
       }
       const style = document.createElement('style');
-      style.dataset.plugin = '@local/dsh-workspace-frontend';
+      style.dataset.plugin = PKG;
       style.dataset.pluginCss = CSS_ID;
       style.textContent = CSS;
       document.head.appendChild(style);
