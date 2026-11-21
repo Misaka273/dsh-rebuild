@@ -5036,6 +5036,140 @@ window.__ModuleLoader__.load({
         }),
       }, RowMenuOverlay));
 
+      // 会话正文里的路径：右键打开共享文件菜单（含「在应用中打开」）。
+      // 文本手势派发不携带坐标，先捕获阶段记下手势，等消费者拿到 sessionId 再解析 token。
+      ctx.inject(['contextMenus', 'uiConversation'], function chatPathMenu(scope) {
+        let pending = null;
+
+        const PATH_CHAR = /[0-9A-Za-z_./\\~$@:+-]/;
+
+        // Paths in prose are often wrapped in quotes/brackets or followed by punctuation.
+        const cleanup = (raw) => String(raw)
+          .trim()
+          .replace(/^[('"`（「『【[<]+/u, '')
+          .replace(/[.,;:!?，。；：！？、)）\]」』】>》"'`]+$/u, '');
+
+        // Reject URLs and prose tokens; `fromCode` trusts inline-code content as-is.
+        const looksLikePath = (token, fromCode) => {
+          if (token.length < 2 || token.length > 400) return false;
+          if (/\s/.test(token)) return false;
+          if (/[<>|"]/.test(token)) return false;
+          if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(token)) return false;
+          if (!token.includes('/') && !token.includes('\\')) return false;
+          if (/[/\\]$/u.test(token)) return true;
+          const last = token.split(/[/\\]/u).pop();
+          if (!last) return false;
+          if (fromCode === true) return true;
+          if (/^[A-Za-z]:[\\/]/u.test(token)) return true;
+          if (/^\\\\/u.test(token)) return true;
+          if (/\.[A-Za-z0-9]{1,12}$/.test(last)) return true;
+          return token.startsWith('./') || token.startsWith('../') || token.startsWith('~/') || token.startsWith('/');
+        };
+
+        // Viewport point -> text caret; Chromium exposes both names depending on version.
+        const textPositionAt = (doc, x, y) => {
+          if (typeof doc.caretPositionFromPoint === 'function') {
+            try {
+              const position = doc.caretPositionFromPoint(x, y);
+              if (position && position.offsetNode) return { node: position.offsetNode, offset: position.offset };
+            } catch (error) {
+              // Fall through to the WebKit variant.
+            }
+          }
+          if (typeof doc.caretRangeFromPoint === 'function') {
+            try {
+              const range = doc.caretRangeFromPoint(x, y);
+              if (range && range.startContainer) return { node: range.startContainer, offset: range.startOffset };
+            } catch (error) {
+              // No caret at this point.
+            }
+          }
+          return null;
+        };
+
+        const resolveToken = (event, source) => {
+          const target = event.target instanceof Element ? event.target : null;
+          const code = target === null ? null : target.closest('code');
+          if (code !== null && source.contains(code)) {
+            const inner = cleanup(code.textContent || '');
+            if (looksLikePath(inner, true)) return inner;
+          }
+          if (typeof document === 'undefined') return null;
+          const point = textPositionAt(document, event.clientX, event.clientY);
+          if (point === null || point.node === null || point.node.nodeType !== 3) return null;
+          if (!source.contains(point.node)) return null;
+          const text = point.node.nodeValue || '';
+          const expand = (index) => {
+            let start = index;
+            let end = index;
+            while (start > 0 && PATH_CHAR.test(text.charAt(start - 1))) start -= 1;
+            while (end < text.length && PATH_CHAR.test(text.charAt(end))) end += 1;
+            return { start, end };
+          };
+          // Caret offsets sometimes land just past the last character; retry one step left.
+          let span = expand(point.offset);
+          if (span.end - span.start < 2) span = expand(Math.max(0, point.offset - 1));
+          const token = cleanup(text.slice(span.start, span.end));
+          if (!looksLikePath(token, false)) return null;
+          return token;
+        };
+
+        scope.effect(() => scope.uiConversation.interactions.register({
+          id: 'session-groups.open-path',
+          onInteraction(request) {
+            // A real selection already brings Electron's native copy menu; adding ours
+            // would stack two menus (the main process menu ignores preventDefault()).
+            if (request.hasSelection) {
+              pending = null;
+              return;
+            }
+            if (request.trigger !== 'contextmenu') {
+              pending = null;
+              return;
+            }
+            const handoff = pending;
+            pending = null;
+            if (handoff === null) return;
+            const event = handoff.event;
+            if (event.defaultPrevented) return;
+            const token = resolveToken(event, handoff.source);
+            if (token === null) return;
+            if (!request.sessionId) return;
+            const menus = scope.contextMenus;
+            if (!menus || typeof menus.open !== 'function' || !menus.registeredKinds) return;
+            // Never open an empty menu: both kinds come from Host-registered providers.
+            const kinds = menus.registeredKinds.getSnapshot();
+            if (!Array.isArray(kinds)) return;
+            const directory = /[/\\]$/u.test(token);
+            const kind = directory && kinds.includes('directory') ? 'directory' : 'file';
+            if (!kinds.includes(kind)) return;
+            request.preventDefault();
+            menus.open({ kind, value: { sessionId: request.sessionId, path: token } }, { x: event.clientX, y: event.clientY });
+          },
+        }), 'session-groups: chat path menu');
+
+        scope.effect(() => {
+          const onContextMenu = (event) => {
+            const el = event.target instanceof Element ? event.target : null;
+            const source = el === null ? null : el.closest('[data-text-interaction-source]');
+            if (source === null || event.defaultPrevented || (event.clientX === 0 && event.clientY === 0)) {
+              pending = null;
+              return;
+            }
+            pending = { event, source };
+            // The consumer runs synchronously during this event; drop stale gestures.
+            setTimeout(() => {
+              if (pending !== null && pending.event === event) pending = null;
+            }, 0);
+          };
+          document.addEventListener('contextmenu', onContextMenu, true);
+          return () => {
+            document.removeEventListener('contextmenu', onContextMenu, true);
+            pending = null;
+          };
+        }, 'session-groups: chat path gesture');
+      });
+
     }
 
     return {
